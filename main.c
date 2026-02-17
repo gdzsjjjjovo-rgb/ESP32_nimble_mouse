@@ -1,13 +1,3 @@
-/*
-  main.c - BLE-only main for ESP32 classic (uses NimBLE)
-
-  - Assumes nimble.h, paw3395.h and pins.h exist in the project and provide the
-    declarations used below.
-  - Adds a weak no-op set_dpi() implementation so you can build before the real
-    DPI routine is brought up on the board.
-  - ISR-driven input handling, accumulation and BLE HID reporting (no USB).
-*/
-
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
