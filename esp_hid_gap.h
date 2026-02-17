@@ -23,7 +23,7 @@
 #elif CONFIG_BT_NIMBLE_ENABLED
 #define HID_DEV_MODE HIDD_BLE_MODE
 #else
-#define HID_DEV_MODE HIDD_IDLE_MODE
+#define HID_DEV_MODE HIDD_BLE_MODE
 #endif
 
 #include "esp_err.h"

@@ -10,9 +10,9 @@
 #include "esp_log.h"
 
 #include "esp_hid_gap.h"
-#include "ble.h"
+#include "nimble.h"
 
-static const char *TAG = "ble";
+static const char *TAG = "nimble";
 
 static const uint8_t mouse_report_map[] = {
     // Application Collection: Mouse
@@ -102,9 +102,9 @@ static esp_hid_raw_report_map_t ble_report_maps[] = {
 };
 
 static esp_hid_device_config_t ble_hid_config = {
-    .device_name = CONFIG_TINYUSB_DESC_PRODUCT_STRING,
-    .manufacturer_name = CONFIG_TINYUSB_DESC_MANUFACTURER_STRING,
-    .serial_number = CONFIG_TINYUSB_DESC_SERIAL_STRING,
+    .device_name = "mouse",
+    .manufacturer_name = "liang",
+    .serial_number = "1234567890",
     .report_maps = ble_report_maps,
     .report_maps_len = 1,
 };
@@ -252,7 +252,7 @@ esp_err_t wake_ble(void)
         ESP_LOGE(TAG, "esp_nimble_enable failed: %d", ret);
     }
 
-    ble_svc_gap_device_name_set(CONFIG_TINYUSB_DESC_PRODUCT_STRING);
+    ble_svc_gap_device_name_set("mouse");
 
     return ret;
 }
