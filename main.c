@@ -1,278 +1,430 @@
 /*
-  main.c -- tailored for gdzsjjjjovo-rgb/ESP32_nimble_mouse
+  main.c - BLE-only main for ESP32 classic (uses NimBLE)
 
-  - Defines ble_report_maps and ble_hid_config for print_report_map.c / esp_hidd
-  - Implements submit_mouse_report (overrides weak stub in paw3395.c)
-  - Provides ble_hid_task_start_up / ble_hid_task_shut_down for esp_hid_gap.c
-  - Initializes NVS, esp_hid_gap, esp_hidd and registers callbacks
-  - Compatible whether nimble_reconnect.c is present or not (weak stub provided)
+  - Assumes nimble.h, paw3395.h and pins.h exist in the project and provide the
+    declarations used below.
+  - Adds a weak no-op set_dpi() implementation so you can build before the real
+    DPI routine is brought up on the board.
+  - ISR-driven input handling, accumulation and BLE HID reporting (no USB).
 */
 
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <inttypes.h>
 
 #include "sdkconfig.h"
+#include "esp_err.h"
+#include "esp_log.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 
+#include "driver/gpio.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
-#include "esp_log.h"
-#include "esp_err.h"
 
-#include "esp_hidd.h"
-#include "esp_hid_common.h"
-#include "esp_hid_gap.h"
+#include "nimble.h"   /* your BLE wrapper: wake_ble(), ble_mounted(), ble_hid_mouse_report() */
+#include "paw3395.h"  /* sensor driver: wake_paw3395(), read_move(), (optional set_dpi) */
+#include "pins.h"     /* board pin definitions (provide pin macros used below) */
 
-/* If nimble_reconnect.c was removed, provide a weak no-op so linking still succeeds.
-   If nimble_reconnect.c exists, its strong definition will override this. */
-void nimble_reconnect_init(void) __attribute__((weak));
-void nimble_reconnect_init(void) { /* no-op if absent */ }
+static const char *TAG = "main";
 
-/* ble_store_config_init may be provided by NimBLE store util; weak stub if absent */
-void ble_store_config_init(void) __attribute__((weak));
-void ble_store_config_init(void) { /* no-op if absent */ }
+/* -------------------------------------------------------------------------
+   Weak stub for set_dpi to allow building before real implementation is added.
+   Remove or replace when you have the real set_dpi() implementation.
+   ------------------------------------------------------------------------- */
+void set_dpi(uint16_t dpi) __attribute__((weak));
+void set_dpi(uint16_t dpi)
+{
+    (void)dpi; /* no-op */
+}
 
-/* Optional helper in print_report_map.c (weak) */
-void print_report_map_info(const esp_hid_raw_report_map_t *rm) __attribute__((weak));
-
-#if CONFIG_BT_NIMBLE_ENABLED
-#include "nimble/nimble_port.h"
-#include "nimble/nimble_port_freertos.h"
-#include "host/ble_hs.h"
+/* -------------------------------------------------------------------------
+   Fallbacks: map CONFIG_* to pin macros from pins.h if CONFIG macros aren't set
+   (this avoids compile errors when sdkconfig doesn't define these).
+   Adjust pins.h to match your board names.
+   ------------------------------------------------------------------------- */
+#ifndef CONFIG_MICRO_PIN_L
+#define CONFIG_MICRO_PIN_L LEFT_BUTTON_GPIO
+#endif
+#ifndef CONFIG_MICRO_PIN_R
+#define CONFIG_MICRO_PIN_R RIGHT_BUTTON_GPIO
+#endif
+#ifndef CONFIG_MICRO_PIN_M
+#define CONFIG_MICRO_PIN_M WHEEL_BUTTON_GPIO
 #endif
 
-static const char *TAG = "main_nimble_mouse";
+#ifndef CONFIG_ENCODER_A_NUM
+#define CONFIG_ENCODER_A_NUM WHEEL_ENC_A_GPIO
+#endif
+#ifndef CONFIG_ENCODER_B_NUM
+#define CONFIG_ENCODER_B_NUM WHEEL_ENC_B_GPIO
+#endif
 
-/* Device name as used in this repo (keeps prior behavior) */
-static const char device_name_str[] = "ESP HID Mouse";
+#ifndef CONFIG_PAW3395D_MOTION_NUM
+#ifdef PAW3395_MOTION_INT
+#define CONFIG_PAW3395D_MOTION_NUM PAW3395_MOTION_INT
+#else
+#error "Motion pin macro not defined — set CONFIG_PAW3395D_MOTION_NUM or PAW3395_MOTION_INT in pins.h"
+#endif
+#endif
 
-/* HID report map (mouse). REPORT_ID placed after Collection(Application) */
-static const uint8_t mouse_report_map[] = {
-    0x05, 0x01,       /* Usage Page (Generic Desktop) */
-    0x09, 0x02,       /* Usage (Mouse) */
-    0xA1, 0x01,       /* Collection (Application) */
+#ifndef CONFIG_MICRO_DEBOUNCE
+#define CONFIG_MICRO_DEBOUNCE (50000)    /* 50 ms in microseconds */
+#endif
+#ifndef CONFIG_ENCODER_DEBOUNCE
+#define CONFIG_ENCODER_DEBOUNCE (20000)  /* 20 ms in microseconds */
+#endif
+#ifndef CONFIG_STOP_INTERVAL_BLE
+#define CONFIG_STOP_INTERVAL_BLE 8       /* ms between BLE HID reports */
+#endif
+#ifndef CONFIG_PAW3395_READ_INTERVAL
+#define CONFIG_PAW3395_READ_INTERVAL 5   /* ms */
+#endif
 
-    0x85, 0x01,       /* REPORT_ID (1) - placed here so parser accepts it */
+/* -------------------------------------------------------------------------
+   Forward declarations expected from other modules (nimble.h / paw3395.h)
+   nimble.h should provide:
+     esp_err_t wake_ble(void);
+     bool ble_mounted(void);
+     void ble_hid_mouse_report(uint8_t buttons, char x, char y, char vertical);
+   paw3395.h should provide sensor init/read functions used below:
+     void wake_paw3395(void);
+     esp_err_t read_move(int16_t *dx, int16_t *dy);
+   ------------------------------------------------------------------------- */
 
-      0x09, 0x01,     /*   Usage (Pointer) */
-      0xA1, 0x00,     /*   Collection (Physical) */
-        0x05, 0x09,   /*     Usage Page (Buttons) */
-        0x19, 0x01,   /*     Usage Minimum (01) */
-        0x29, 0x03,   /*     Usage Maximum (03) */
-        0x15, 0x00,   /*     Logical Minimum (0) */
-        0x25, 0x01,   /*     Logical Maximum (1) */
-        0x95, 0x03,   /*     Report Count (3) */
-        0x75, 0x01,   /*     Report Size (1) */
-        0x81, 0x02,   /*     Input (Data,Var,Abs) */
-        0x95, 0x01,   /*     Report Count (1) */
-        0x75, 0x05,   /*     Report Size (5) */
-        0x81, 0x03,   /*     Input (Cnst,Var,Abs) */
+/* -------------------------------------------------------------------------
+   Helper utilities
+   ------------------------------------------------------------------------- */
+static inline int8_t clamp_int8(int16_t v)
+{
+    if (v > 127) return 127;
+    if (v < -128) return -128;
+    return (int8_t)v;
+}
 
-        0x05, 0x01,   /*     Usage Page (Generic Desktop) */
-        0x09, 0x30,   /*     Usage (X) */
-        0x09, 0x31,   /*     Usage (Y) */
-        0x09, 0x38,   /*     Usage (Wheel) */
-        0x15, 0x81,   /*     Logical Minimum (-127) */
-        0x25, 0x7F,   /*     Logical Maximum (127) */
-        0x75, 0x08,   /*     Report Size (8) */
-        0x95, 0x03,   /*     Report Count (3) */
-        0x81, 0x06,   /*     Input (Data,Var,Rel) */
-      0xC0,
-    0xC0
-};
+static inline uint8_t get_encoder_state(void)
+{
+    return (gpio_get_level(CONFIG_ENCODER_A_NUM) << 1) | gpio_get_level(CONFIG_ENCODER_B_NUM);
+}
 
-static esp_hid_raw_report_map_t ble_report_maps[] = {
-    { .data = (uint8_t *)mouse_report_map, .len = sizeof(mouse_report_map) }
-};
+/* -------------------------------------------------------------------------
+   Types and state
+   ------------------------------------------------------------------------- */
+typedef struct {
+    uint8_t bit;
+    gpio_num_t gpio;
+    uint64_t last_isr_tick;
+} button_info_t;
 
-static const esp_hid_device_config_t ble_hid_config = {
-    .vendor_id         = 0x16C0,
-    .product_id        = 0x05DF,
-    .version           = 0x0100,
-    .device_name       = device_name_str,
-    .manufacturer_name = "Espressif",
-    .serial_number     = "0001",
-    .report_maps       = ble_report_maps,
-    .report_maps_len   = sizeof(ble_report_maps) / sizeof(ble_report_maps[0])
-};
+typedef struct {
+    int16_t x;
+    int16_t y;
+    int8_t vertical;
+} accum_item_t;
 
-/* Runtime state shared with other modules */
-static esp_hidd_dev_t *s_hid_dev = NULL;
-static volatile bool s_hid_connected = false;
-static TaskHandle_t s_demo_task = NULL;
+/* Button mapping (bits) */
+static button_info_t btn_left    = { .bit = 0, .gpio = CONFIG_MICRO_PIN_L };
+static button_info_t btn_mid     = { .bit = 2, .gpio = CONFIG_MICRO_PIN_M };
+static button_info_t btn_right   = { .bit = 1, .gpio = CONFIG_MICRO_PIN_R };
 
-/* HID demo task (sends reports with report_id = 1) */
-static void hid_mouse_demo_task(void *pv)
+/* Runtime accumulators and sync objects */
+static int16_t accum_x = 0;
+static int16_t accum_y = 0;
+static int8_t accum_vertical = 0;
+static SemaphoreHandle_t accum_mutex = NULL;
+static QueueHandle_t accum_queue = NULL;
+
+static uint8_t motion_level = 0;
+static TaskHandle_t move_task_handle = NULL;
+static uint8_t encoder_state = 0;
+static uint64_t last_slide_tick = 0;
+
+static uint8_t buttons_temp = 0;
+static uint8_t buttons = 0;
+static TaskHandle_t report_task_handle = NULL;
+
+/* -------------------------------------------------------------------------
+   ISR handlers
+   ------------------------------------------------------------------------- */
+static void IRAM_ATTR on_move(void *args)
+{
+    (void)args;
+    motion_level = gpio_get_level(CONFIG_PAW3395D_MOTION_NUM);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    vTaskNotifyGiveFromISR(move_task_handle, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+static void IRAM_ATTR on_click(void *args)
+{
+    uint64_t now = esp_timer_get_time();
+    button_info_t *btn = (button_info_t *)args;
+
+    int level = gpio_get_level(btn->gpio);
+
+    if (!level) buttons_temp |= (1 << btn->bit);
+    else buttons_temp &= ~(1 << btn->bit);
+
+    if (buttons_temp == buttons) return;
+
+    if ((now - btn->last_isr_tick) >= CONFIG_MICRO_DEBOUNCE) {
+        btn->last_isr_tick = now;
+        buttons = buttons_temp;
+        accum_item_t item = {0};
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(accum_queue, &item, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+static void IRAM_ATTR on_scroll(void *args)
+{
+    (void)args;
+    uint64_t now = esp_timer_get_time();
+
+    uint8_t encoder_state_temp = get_encoder_state();
+    if (encoder_state_temp == encoder_state) return;
+
+    int8_t state_transition = (encoder_state << 2) | encoder_state_temp;
+    int8_t vertical;
+    switch (state_transition) {
+    case 0b0001: case 0b0111: case 0b1110: case 0b1000:
+        vertical = -1; break;
+    case 0b0010: case 0b1011: case 0b1101: case 0b0100:
+        vertical = 1; break;
+    default:
+        return;
+    }
+
+    if ((now - last_slide_tick) >= CONFIG_ENCODER_DEBOUNCE) {
+        last_slide_tick = now;
+        accum_item_t item = { .x = 0, .y = 0, .vertical = vertical };
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(accum_queue, &item, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+
+    encoder_state = encoder_state_temp;
+}
+
+/* -------------------------------------------------------------------------
+   Register ISRs
+   ------------------------------------------------------------------------- */
+static void reg_isr_handler(void)
+{
+    gpio_config_t motion_conf = {
+        .pin_bit_mask = BIT64(CONFIG_PAW3395D_MOTION_NUM),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
+    };
+    gpio_config(&motion_conf);
+    gpio_isr_handler_add(CONFIG_PAW3395D_MOTION_NUM, on_move, NULL);
+
+    gpio_config_t switch_conf = {
+        .pin_bit_mask = BIT64(CONFIG_MICRO_PIN_L) | BIT64(CONFIG_MICRO_PIN_R) |
+                        BIT64(CONFIG_MICRO_PIN_M) ,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
+    };
+    gpio_config(&switch_conf);
+    gpio_isr_handler_add(CONFIG_MICRO_PIN_L, on_click, &btn_left);
+    gpio_isr_handler_add(CONFIG_MICRO_PIN_R, on_click, &btn_right);
+    gpio_isr_handler_add(CONFIG_MICRO_PIN_M, on_click, &btn_mid);
+
+    gpio_config_t enc_conf = {
+        .pin_bit_mask = BIT64(CONFIG_ENCODER_B_NUM) | BIT64(CONFIG_ENCODER_A_NUM),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLDOWN_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
+    };
+    gpio_config(&enc_conf);
+    gpio_isr_handler_add(CONFIG_ENCODER_B_NUM, on_scroll, NULL);
+    gpio_isr_handler_add(CONFIG_ENCODER_A_NUM, on_scroll, NULL);
+
+    encoder_state = get_encoder_state();
+}
+
+/* -------------------------------------------------------------------------
+   Reporting
+   ------------------------------------------------------------------------- */
+static void report_send(uint8_t accum_buttons_temp, int16_t accum_x_temp, int16_t accum_y_temp, int8_t accum_vertical_temp)
+{
+    do {
+        int8_t x_send = clamp_int8(accum_x_temp);
+        int8_t y_send = clamp_int8(accum_y_temp);
+
+        if (ble_mounted()) {
+            /* nimble.h uses char for x/y/vertical — cast safely */
+            ble_hid_mouse_report(accum_buttons_temp, (char)x_send, (char)y_send, (char)accum_vertical_temp);
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_STOP_INTERVAL_BLE));
+        } else {
+            /* Not connected: short delay (alternatively buffer) */
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        accum_x_temp -= x_send;
+        accum_y_temp -= y_send;
+        accum_vertical_temp = 0;
+    } while (accum_x_temp != 0 || accum_y_temp != 0 || accum_vertical_temp != 0);
+}
+
+/* report loop task */
+static void report_loop_task(void *pv)
 {
     (void)pv;
-    uint8_t report[4];
-    while (1) {
-        if (s_hid_connected && s_hid_dev) {
-            report[0] = 0;    /* buttons */
-            report[1] = 10;   /* dx */
-            report[2] = 0;    /* dy */
-            report[3] = 0;    /* wheel */
-            esp_err_t err = esp_hidd_dev_input_set(s_hid_dev, 1, 0, report, sizeof(report)); /* report_id=1 */
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "esp_hidd_dev_input_set failed: %d", err);
-            } else {
-                ESP_LOGI(TAG, "Sent mouse report id=1 dx=%d", report[1]);
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        if (xSemaphoreTake(accum_mutex, portMAX_DELAY) == pdTRUE) {
+            uint8_t accum_buttons_temp = buttons;
+            int16_t accum_x_temp = accum_x;
+            int16_t accum_y_temp = accum_y;
+            int8_t accum_vertical_temp = accum_vertical;
+
+            accum_x = 0;
+            accum_y = 0;
+            accum_vertical = 0;
+
+            xSemaphoreGive(accum_mutex);
+
+            report_send(accum_buttons_temp, accum_x_temp, accum_y_temp, accum_vertical_temp);
+        }
+    }
+}
+
+/* accum loop task */
+static void accum_loop_task(void *pv)
+{
+    (void)pv;
+    accum_item_t item;
+    for (;;) {
+        if (xQueueReceive(accum_queue, &item, portMAX_DELAY) == pdPASS) {
+            if (xSemaphoreTake(accum_mutex, portMAX_DELAY) == pdTRUE) {
+                accum_x += item.x;
+                accum_y += item.y;
+                accum_vertical += item.vertical;
+                xSemaphoreGive(accum_mutex);
+
+                xTaskNotifyGive(report_task_handle);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
 
-/* Start/stop helpers expected by esp_hid_gap.c (non-static so other TU can call) */
-void ble_hid_task_start_up(void)
+/* move loop task: poll sensor while motion pin indicates motion */
+static void move_loop_task(void *pv)
 {
-    if (s_demo_task) return;
-    if (xTaskCreate(hid_mouse_demo_task, "hid_demo", 4 * 1024, NULL, tskIDLE_PRIORITY + 1, &s_demo_task) != pdPASS) {
-        ESP_LOGW(TAG, "Failed to create hid demo task");
-        s_demo_task = NULL;
-    } else {
-        ESP_LOGI(TAG, "HID demo started");
-    }
-}
+    (void)pv;
+    int16_t x = 0, y = 0;
 
-void ble_hid_task_shut_down(void)
-{
-    if (!s_demo_task) return;
-    vTaskDelete(s_demo_task);
-    s_demo_task = NULL;
-    ESP_LOGI(TAG, "HID demo stopped");
-}
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-/* Strong submit_mouse_report used by paw3395.c to deliver sensor motion */
-void submit_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel)
-{
-    if (!s_hid_dev || !s_hid_connected) return;
-
-    uint8_t report[4];
-    report[0] = buttons;
-    report[1] = (uint8_t)dx;
-    report[2] = (uint8_t)dy;
-    report[3] = (uint8_t)wheel;
-
-    esp_err_t err = esp_hidd_dev_input_set(s_hid_dev, 1, 0, report, sizeof(report)); /* report_id = 1 */
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "submit_mouse_report: esp_hidd_dev_input_set failed: %d", err);
-    }
-}
-
-/* esp_hidd event callback */
-static void hidd_event_cb(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
-{
-    (void)handler_args; (void)base;
-    esp_hidd_event_t ev = (esp_hidd_event_t)id;
-    esp_hidd_event_data_t *param = (esp_hidd_event_data_t *)event_data;
-
-    switch (ev) {
-    case ESP_HIDD_START_EVENT:
-        ESP_LOGI(TAG, "ESP_HIDD_START_EVENT");
-        ESP_LOGI(TAG, "HID device_name='%s'", ble_hid_config.device_name);
-        ESP_LOGI(TAG, "report_maps_len=%d", (int)ble_hid_config.report_maps_len);
-        if (print_report_map_info) {
-            print_report_map_info(&ble_report_maps[0]);
-        } else {
-            ESP_LOG_BUFFER_HEX(TAG, ble_report_maps[0].data, (ble_report_maps[0].len > 128) ? 128 : ble_report_maps[0].len);
+        while (motion_level == 0) {
+            if (read_move(&x, &y) == ESP_OK) {
+                if (x != 0 || y != 0) {
+                    accum_item_t it = { .x = x, .y = y, .vertical = 0 };
+                    xQueueSend(accum_queue, &it, 0);
+                    x = y = 0;
+                }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_PAW3395_READ_INTERVAL));
         }
-        break;
 
-    case ESP_HIDD_CONNECT_EVENT:
-        ESP_LOGI(TAG, "ESP_HIDD_CONNECT_EVENT");
-        s_hid_connected = true;
-        s_hid_dev = param->connect.dev;
-        /* Do not start demo immediately; let pairing/encryption/subscribe complete (nimble_reconnect or gap handler will call ble_hid_task_start_up) */
-        break;
+        /* drain */
+        if (read_move(&x, &y) == ESP_OK) {
+            if (x != 0 || y != 0) {
+                accum_item_t it = { .x = x, .y = y, .vertical = 0 };
+                xQueueSend(accum_queue, &it, 0);
+            }
+        }
 
-    case ESP_HIDD_DISCONNECT_EVENT:
-        ESP_LOGI(TAG, "ESP_HIDD_DISCONNECT_EVENT reason=%d", param->disconnect.reason);
-        s_hid_connected = false;
-        ble_hid_task_shut_down();
-        /* Re-advertise using esp_hid helper */
-        esp_hid_ble_gap_adv_start();
-        break;
-
-    case ESP_HIDD_OUTPUT_EVENT:
-        ESP_LOGI(TAG, "ESP_HIDD_OUTPUT_EVENT len=%d", param->output.length);
-        ESP_LOG_BUFFER_HEX(TAG, param->output.data, param->output.length);
-        break;
-
-    default:
-        ESP_LOGI(TAG, "HIDD event id=%d", (int)ev);
-        break;
+        x = y = 0;
     }
 }
 
-#if CONFIG_BT_NIMBLE_ENABLED
-/* NimBLE host callbacks (lightweight) */
-static void ble_app_on_sync(void)
+/* API helpers */
+void api_set_dpi(uint16_t dpi) { set_dpi(dpi); }
+
+void api_macro(int16_t x, int16_t y, uint8_t btns)
 {
-    ESP_LOGI(TAG, "ble_app_on_sync: host synced");
-    /* esp_hid_gap / esp_nimble_enable in repo will handle advertising start */
+    accum_item_t item = { .x = x, .y = y, .vertical = 0 };
+    buttons = btns; /* preserve original (thread-unsafe) behavior */
+    xQueueSend(accum_queue, &item, 0);
 }
 
-static void ble_app_on_reset(int reason)
-{
-    ESP_LOGW(TAG, "ble_app_on_reset: reason=%d", reason);
-}
-#endif
-
+/* -------------------------------------------------------------------------
+   app_main
+   ------------------------------------------------------------------------- */
 void app_main(void)
 {
-    esp_err_t err;
+    esp_err_t ret;
 
-    /* Initialize NVS */
-    err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    /* NVS for BLE bonding storage */
+    ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
+        ret = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(err);
+    ESP_ERROR_CHECK(ret);
 
-    /* Helpful log levels */
-    esp_log_level_set("*", ESP_LOG_INFO);
-    esp_log_level_set("ble_sm", ESP_LOG_DEBUG);
-    esp_log_level_set("ble_store", ESP_LOG_DEBUG);
-    esp_log_level_set("ble_hs", ESP_LOG_INFO);
-    esp_log_level_set("NimBLE", ESP_LOG_INFO);
+    /* Start BLE */
+    ret = wake_ble();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "wake_ble failed: %s", esp_err_to_name(ret));
+        /* continue: input tasks still useful but BLE won't send */
+    }
 
-    ESP_LOGI(TAG, "Starting HID application");
+    /* Initialize sensor */
+    wake_paw3395();
 
-    /* Optional init helpers (weak no-op if absent) */
-    nimble_reconnect_init();
-    ble_store_config_init();
+    /* Install GPIO ISR service */
+    ret = gpio_install_isr_service(0);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "GPIO ISR service installed");
+    }
 
-#if CONFIG_BT_NIMBLE_ENABLED
-    /* register NimBLE callbacks if host is started by repo's shim */
-    ble_hs_cfg.sync_cb  = ble_app_on_sync;
-    ble_hs_cfg.reset_cb = ble_app_on_reset;
-#endif
+    reg_isr_handler();
+    ESP_LOGI(TAG, "ISR handlers ready");
 
-    /* Initialize controller + GAP via esp_hid_gap helper (repo provides esp_hid_gap.c) */
-    err = esp_hid_gap_init(HID_DEV_MODE);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_hid_gap_init failed: %d", err);
+    /* Create queue and mutex */
+    accum_queue = xQueueCreate(32, sizeof(accum_item_t));
+    if (!accum_queue) {
+        ESP_LOGE(TAG, "xQueueCreate failed");
+        return;
+    }
+    accum_mutex = xSemaphoreCreateMutex();
+    if (!accum_mutex) {
+        ESP_LOGE(TAG, "xSemaphoreCreateMutex failed");
         return;
     }
 
-    /* Prepare advertisement data (device name) */
-    err = esp_hid_ble_gap_adv_init(ESP_HID_APPEARANCE_GENERIC, ble_hid_config.device_name);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_hid_ble_gap_adv_init failed: %d", err);
+    /* Create tasks */
+    if (xTaskCreate(report_loop_task, "report_loop_task", 4096, NULL, 1, &report_task_handle) != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate report_loop_task failed");
+        return;
+    }
+    if (xTaskCreate(accum_loop_task, "accum_loop_task", 4096, NULL, 2, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate accum_loop_task failed");
+        return;
+    }
+    if (xTaskCreate(move_loop_task, "move_loop_task", 4096, NULL, 1, &move_task_handle) != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate move_loop_task failed");
         return;
     }
 
-    /* Initialize HID device and register callback */
-    err = esp_hidd_dev_init(&ble_hid_config, ESP_HID_TRANSPORT_BLE, hidd_event_cb, &s_hid_dev);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_hidd_dev_init failed: %d", err);
-        return;
-    }
-
-    ESP_LOGI(TAG, "app_main finished");
+    ESP_LOGI(TAG, "app_main finished, tasks running");
 }

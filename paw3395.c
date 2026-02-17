@@ -1,225 +1,391 @@
-/*
-  PAW3395 driver (datasheet-aligned) with weak submit_mouse_report stub.
 
-  - Provides a weak default implementation of submit_mouse_report to avoid
-    linker errors when main does not define it.
-  - If main.c provides submit_mouse_report (strong symbol), that one will be used.
-*/
-
-#include "paw3395.h"
-#include "pins.h"
-#include "esp_log.h"
-#include "driver/spi_master.h"
+#include <stdlib.h>
 #include "driver/gpio.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include <string.h>
-#include <stdint.h>
+#include "driver/spi_master.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "pins.h"
+#include "spi.h"
+#include "paw3395.h"
 
-static const char *TAG = "paw3395_drv";
-static spi_device_handle_t s_spi = NULL;
-static paw3395_config_t s_cfg;
+static const char *TAG = "paw3395";
 
-/* Registers */
-#define REG_POWER_UP_RESET 0x3A
-#define REG_MOTION         0x02
-#define REG_DELTA_X        0x03
-#define REG_DELTA_Y        0x04
+static uint16_t dpi; // actually its cpi
 
-/* Weak stub for submit_mouse_report.
-   If the application (main.c) defines submit_mouse_report, that strong symbol
-   will override this weak stub. This prevents link errors when the app does not
-   provide a report submission implementation (useful during debugging).
-*/
-void submit_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel) __attribute__((weak));
-void submit_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel)
+static inline void delay_ms(uint8_t nms)
 {
-    (void)buttons;
-    (void)dx;
-    (void)dy;
-    (void)wheel;
-    // weak stub: do nothing
+    vTaskDelay(pdMS_TO_TICKS(nms));
 }
 
-/* Low-level register write: write one or more bytes */
-static esp_err_t paw_write_regs(uint8_t reg, const uint8_t *data, size_t len)
+static inline void delay_us(uint32_t nus)
 {
-    if (!s_spi) return ESP_ERR_INVALID_STATE;
-
-    size_t tx_len = 1 + len;
-    uint8_t tx[16];
-    if (tx_len > sizeof(tx)) return ESP_ERR_INVALID_ARG;
-
-    tx[0] = reg | 0x80; // write command
-    for (size_t i = 0; i < len; i++) tx[1 + i] = data[i];
-
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = tx_len * 8;
-    t.tx_buffer = tx;
-    return spi_device_transmit(s_spi, &t);
+    esp_rom_delay_us(nus);
 }
 
-/* Low-level register read: read len bytes starting at reg */
-static esp_err_t paw_read_regs(uint8_t reg, uint8_t *out, size_t len)
+static inline void delay_120ns()
 {
-    if (!s_spi) return ESP_ERR_INVALID_STATE;
-    if (len + 1 > 16) return ESP_ERR_INVALID_ARG;
-
-    uint8_t tx[16];
-    uint8_t rx[16];
-    memset(tx, 0x00, sizeof(tx));
-    memset(rx, 0x00, sizeof(rx));
-
-    tx[0] = reg; // read command
-    for (size_t i = 1; i <= len; i++) tx[i] = 0x00;
-
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = (1 + len) * 8;
-    t.tx_buffer = tx;
-    t.rx_buffer = rx;
-
-    esp_err_t ret = spi_device_transmit(s_spi, &t);
-    if (ret == ESP_OK) {
-        for (size_t i = 0; i < len; i++) out[i] = rx[1 + i];
-    }
-    return ret;
+    // Minimum delay set to 1 microsecond.
+    // The target of 120 nanoseconds cannot be reliably achieved due to hardware constraints (Xtensa architecture & CPU clock cycle limits).
+    delay_us(1);
 }
 
-static esp_err_t paw_read_reg(uint8_t reg, uint8_t *val) { return paw_read_regs(reg, val, 1); }
-static esp_err_t paw_write_reg(uint8_t reg, uint8_t val) { return paw_write_regs(reg, &val, 1); }
-
-esp_err_t paw3395_read_motion(int8_t *dx, int8_t *dy, uint8_t *buttons)
+static inline void delay_500ns()
 {
-    if (!s_spi) return ESP_ERR_INVALID_STATE;
-
-    uint8_t motion = 0;
-    esp_err_t r = paw_read_reg(REG_MOTION, &motion);
-    if (r != ESP_OK) return r;
-    if ((motion & 0x80) == 0 && motion == 0) return ESP_ERR_NOT_FOUND;
-
-    uint8_t x = 0, y = 0;
-    r = paw_read_reg(REG_DELTA_X, &x);
-    if (r != ESP_OK) return r;
-    r = paw_read_reg(REG_DELTA_Y, &y);
-    if (r != ESP_OK) return r;
-
-    *dx = (int8_t)x;
-    *dy = (int8_t)y;
-    *buttons = 0;
-    return ESP_OK;
+    // Same to delay_120ns()
+    delay_us(1);
 }
 
-static void poll_task(void *arg)
+static inline void cs_high(void)
 {
-    const TickType_t normal_delay = pdMS_TO_TICKS(1000 / MOUSE_REPORT_RATE_DEFAULT);
-    const TickType_t no_device_delay = pdMS_TO_TICKS(500);
-
-    while (1) {
-        if (!s_spi) {
-            vTaskDelay(no_device_delay);
-            continue;
-        }
-
-        int8_t dx = 0, dy = 0;
-        uint8_t buttons = 0;
-        esp_err_t r = paw3395_read_motion(&dx, &dy, &buttons);
-        if (r == ESP_OK) {
-            ESP_LOGI(TAG, "motion dx=%d dy=%d", dx, dy);
-            submit_mouse_report(buttons, dx, dy, 0);
-            vTaskDelay(normal_delay);
-        } else if (r == ESP_ERR_NOT_FOUND) {
-            vTaskDelay(no_device_delay);
-        } else {
-            ESP_LOGW(TAG, "paw3395 read error: %s", esp_err_to_name(r));
-            vTaskDelay(no_device_delay);
-        }
-    }
+    delay_120ns();
+    gpio_set_level(PAW3395_SPI_CS, 1);
 }
 
-esp_err_t paw3395_init(const paw3395_config_t *cfg)
+static inline void cs_low(void)
 {
-    if (!cfg) return ESP_ERR_INVALID_ARG;
-    s_cfg = *cfg;
+    gpio_set_level(PAW3395_SPI_CS, 0);
+    delay_120ns();
+}
 
-    spi_bus_config_t buscfg = {
-        .mosi_io_num = s_cfg.pin_mosi,
-        .miso_io_num = s_cfg.pin_miso,
-        .sclk_io_num = s_cfg.pin_sclk,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 64
-    };
+static inline void paw3395_write(uint8_t reg_addr, uint8_t reg_data)
+{
+    cs_low();
 
-    esp_err_t ret = spi_bus_initialize(s_cfg.spi_host, &buscfg, 1);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    spi_write_data(reg_addr, reg_data);
 
-    spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 2000000,
-        .mode = 3,
-        .spics_io_num = s_cfg.pin_cs,
-        .queue_size = 3,
-    };
+    cs_high();
 
-    ret = spi_bus_add_device(s_cfg.spi_host, &devcfg, &s_spi);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "spi_bus_add_device failed: %s (device disabled)", esp_err_to_name(ret));
-        s_spi = NULL;
-        return ret;
-    }
+    delay_us(5);
+}
 
-    gpio_reset_pin(s_cfg.pin_reset);
-    gpio_set_direction(s_cfg.pin_reset, GPIO_MODE_OUTPUT);
-    gpio_set_level(s_cfg.pin_reset, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level(s_cfg.pin_reset, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));
+static inline uint8_t paw3395_read(uint8_t reg_addr)
+{
+    uint8_t data = 0;
+    cs_low();
 
-    ret = paw_write_reg(REG_POWER_UP_RESET, 0x5A);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "POWER_UP_RESET write failed: %s", esp_err_to_name(ret));
-    }
-    vTaskDelay(pdMS_TO_TICKS(5));
+    spi_send_read(reg_addr);
 
-    uint8_t probe;
-    bool ok = true;
-    for (uint8_t r = REG_MOTION; r <= (REG_MOTION + 4); r++) {
-        ret = paw_read_reg(r, &probe);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "probe reg 0x%02X failed: %s", r, esp_err_to_name(ret));
-            ok = false;
+    delay_us(2);
+
+    // Read data
+    data = spi_read_data();
+
+    cs_high();
+
+    delay_us(2);
+
+    return data;
+}
+
+static void load_powerup_reg_setting()
+{
+    paw3395_write(0x7F, 0x07);
+    paw3395_write(0x40, 0x41);
+    paw3395_write(0x7F, 0x00);
+    paw3395_write(0x40, 0x80);
+    paw3395_write(0x7F, 0x0E);
+    paw3395_write(0x55, 0x0D);
+    paw3395_write(0x56, 0x1B);
+    paw3395_write(0x57, 0xE8);
+    paw3395_write(0x58, 0xD5);
+    paw3395_write(0x7F, 0x14);
+    paw3395_write(0x42, 0xBC);
+    paw3395_write(0x43, 0x74);
+    paw3395_write(0x4B, 0x20);
+    paw3395_write(0x4D, 0x00);
+    paw3395_write(0x53, 0x0E);
+    paw3395_write(0x7F, 0x05);
+    paw3395_write(0x44, 0x04);
+    paw3395_write(0x4D, 0x06);
+    paw3395_write(0x51, 0x40);
+    paw3395_write(0x53, 0x40);
+    paw3395_write(0x55, 0xCA);
+    paw3395_write(0x5A, 0xE8);
+    paw3395_write(0x5B, 0xEA);
+    paw3395_write(0x61, 0x31);
+    paw3395_write(0x62, 0x64);
+    paw3395_write(0x6D, 0xB8);
+    paw3395_write(0x6E, 0x0F);
+
+    paw3395_write(0x70, 0x02);
+    paw3395_write(0x4A, 0x2A);
+    paw3395_write(0x60, 0x26);
+    paw3395_write(0x7F, 0x06);
+    paw3395_write(0x6D, 0x70);
+    paw3395_write(0x6E, 0x60);
+    paw3395_write(0x6F, 0x04);
+    paw3395_write(0x53, 0x02);
+    paw3395_write(0x55, 0x11);
+    paw3395_write(0x7A, 0x01);
+    paw3395_write(0x7D, 0x51);
+    paw3395_write(0x7F, 0x07);
+    paw3395_write(0x41, 0x10);
+    paw3395_write(0x42, 0x32);
+    paw3395_write(0x43, 0x00);
+    paw3395_write(0x7F, 0x08);
+    paw3395_write(0x71, 0x4F);
+    paw3395_write(0x7F, 0x09);
+    paw3395_write(0x62, 0x1F);
+    paw3395_write(0x63, 0x1F);
+    paw3395_write(0x65, 0x03);
+    paw3395_write(0x66, 0x03);
+    paw3395_write(0x67, 0x1F);
+    paw3395_write(0x68, 0x1F);
+    paw3395_write(0x69, 0x03);
+    paw3395_write(0x6A, 0x03);
+    paw3395_write(0x6C, 0x1F);
+
+    paw3395_write(0x6D, 0x1F);
+    paw3395_write(0x51, 0x04);
+    paw3395_write(0x53, 0x20);
+    paw3395_write(0x54, 0x20);
+    paw3395_write(0x71, 0x0C);
+    paw3395_write(0x72, 0x07);
+    paw3395_write(0x73, 0x07);
+    paw3395_write(0x7F, 0x0A);
+    paw3395_write(0x4A, 0x14);
+    paw3395_write(0x4C, 0x14);
+    paw3395_write(0x55, 0x19);
+    paw3395_write(0x7F, 0x14);
+    paw3395_write(0x4B, 0x30);
+    paw3395_write(0x4C, 0x03);
+    paw3395_write(0x61, 0x0B);
+    paw3395_write(0x62, 0x0A);
+    paw3395_write(0x63, 0x02);
+    paw3395_write(0x7F, 0x15);
+    paw3395_write(0x4C, 0x02);
+    paw3395_write(0x56, 0x02);
+    paw3395_write(0x41, 0x91);
+    paw3395_write(0x4D, 0x0A);
+    paw3395_write(0x7F, 0x0C);
+    paw3395_write(0x4A, 0x10);
+    paw3395_write(0x4B, 0x0C);
+    paw3395_write(0x4C, 0x40);
+    paw3395_write(0x41, 0x25);
+    paw3395_write(0x55, 0x18);
+    paw3395_write(0x56, 0x14);
+    paw3395_write(0x49, 0x0A);
+    paw3395_write(0x42, 0x00);
+    paw3395_write(0x43, 0x2D);
+    paw3395_write(0x44, 0x0C);
+    paw3395_write(0x54, 0x1A);
+    paw3395_write(0x5A, 0x0D);
+    paw3395_write(0x5F, 0x1E);
+    paw3395_write(0x5B, 0x05);
+    paw3395_write(0x5E, 0x0F);
+    paw3395_write(0x7F, 0x0D);
+    paw3395_write(0x48, 0xDD);
+    paw3395_write(0x4F, 0x03);
+    paw3395_write(0x52, 0x49);
+
+    paw3395_write(0x51, 0x00);
+    paw3395_write(0x54, 0x5B);
+    paw3395_write(0x53, 0x00);
+
+    paw3395_write(0x56, 0x64);
+    paw3395_write(0x55, 0x00);
+    paw3395_write(0x58, 0xA5);
+    paw3395_write(0x57, 0x02);
+    paw3395_write(0x5A, 0x29);
+    paw3395_write(0x5B, 0x47);
+    paw3395_write(0x5C, 0x81);
+    paw3395_write(0x5D, 0x40);
+    paw3395_write(0x71, 0xDC);
+    paw3395_write(0x70, 0x07);
+    paw3395_write(0x73, 0x00);
+    paw3395_write(0x72, 0x08);
+    paw3395_write(0x75, 0xDC);
+    paw3395_write(0x74, 0x07);
+    paw3395_write(0x77, 0x00);
+    paw3395_write(0x76, 0x08);
+    paw3395_write(0x7F, 0x10);
+    paw3395_write(0x4C, 0xD0);
+    paw3395_write(0x7F, 0x00);
+    paw3395_write(0x4F, 0x63);
+    paw3395_write(0x4E, 0x00);
+    paw3395_write(0x52, 0x63);
+    paw3395_write(0x51, 0x00);
+    paw3395_write(0x54, 0x54);
+    paw3395_write(0x5A, 0x10);
+    paw3395_write(0x77, 0x4F);
+    paw3395_write(0x47, 0x01);
+    paw3395_write(0x5B, 0x40);
+    paw3395_write(0x64, 0x60);
+    paw3395_write(0x65, 0x06);
+    paw3395_write(0x66, 0x13);
+    paw3395_write(0x67, 0x0F);
+    paw3395_write(0x78, 0x01);
+    paw3395_write(0x79, 0x9C);
+    paw3395_write(0x40, 0x00);
+    paw3395_write(0x55, 0x02);
+    paw3395_write(0x23, 0x70);
+    paw3395_write(0x22, 0x01);
+
+    delay_ms(1);
+
+    // Read register 0x6C at 1ms interval until value
+    // 0x80 is obtained or read up to 60 times, this
+    // register read interval must be carried out at 1ms
+    // interval with timing tolerance of +-1%
+    uint8_t i;
+    for (i = 0; i < 60; i++)
+    {
+        if (paw3395_read(0x6C) == 0x80)
+        {
             break;
-        } else {
-            ESP_LOGD(TAG, "probe reg 0x%02X = 0x%02X", r, probe);
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        delay_ms(1);
     }
 
-    gpio_reset_pin(s_cfg.pin_int);
-    gpio_set_direction(s_cfg.pin_int, GPIO_MODE_INPUT);
-
-    BaseType_t ok_task = xTaskCreate(poll_task, "paw3395_poll", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
-    if (ok_task != pdPASS) {
-        ESP_LOGE(TAG, "create paw3395 poll task failed");
-        if (s_spi) {
-            spi_bus_remove_device(s_spi);
-            s_spi = NULL;
-        }
-        return ESP_FAIL;
+    if (i == 60)
+    {
+        paw3395_write(0x7F, 0x14);
+        paw3395_write(0x6C, 0x00);
+        paw3395_write(0x7F, 0x00);
     }
 
-    ESP_LOGI(TAG, "paw3395 initialized (probe %s)", ok ? "OK" : "FAILED");
-    return ESP_OK;
+    paw3395_write(0x22, 0x00);
+    paw3395_write(0x55, 0x00);
+    paw3395_write(0x7F, 0x07);
+    paw3395_write(0x40, 0x40);
+    paw3395_write(0x7F, 0x00);
 }
 
-void paw3395_deinit(void)
+static uint8_t motion_burst_buffer[12] = {0};
+
+static void read_motion()
 {
-    if (s_spi) {
-        spi_bus_remove_device(s_spi);
-        s_spi = NULL;
+    cs_low();
+
+    spi_send_read(MOTION_BURST_ADR);
+
+    delay_us(2);
+
+    for (uint8_t i = 0; i < 12; i++)
+    {
+        motion_burst_buffer[i] = spi_read_data();
+    }
+
+    cs_high();
+    delay_500ns();
+}
+
+void resume_dpi(void);
+
+void wake_paw3395()
+{
+    ESP_LOGI(TAG, "Wake paw3395 begin.");
+
+    delay_ms(50); // wait 50 ms
+
+    // reset SPI
+    cs_high();
+    cs_low();
+
+    // write 0x5A to POWER_UP_RESET
+    paw3395_write(0x3A, 0x5A);
+    delay_ms(5);
+
+    // load Power-up initialization register setting.
+    load_powerup_reg_setting();
+
+    // read registers 0x02, 0x03, 0x04, 0x05 and 0x06 one tiime regardless of the motion bit state.
+    paw3395_read(0x02);
+    paw3395_read(0x03);
+    paw3395_read(0x04);
+    paw3395_read(0x05);
+    paw3395_read(0x06);
+
+    ESP_LOGI(TAG, "PRODUCT_ID:0x%02x", paw3395_read(0x00));
+
+    // our paw3395 install reverse.so we need reverse axis_x
+    paw3395_write(0x5B, 0x20);
+
+    ESP_LOGI(TAG, "Wake paw3395 end.");
+
+    resume_dpi();
+}
+
+void read_move(int16_t *x, int16_t *y)
+{
+    read_motion();
+
+    *x += (int16_t)(motion_burst_buffer[2] + (motion_burst_buffer[3] << 8));
+    *y += (int16_t)(motion_burst_buffer[4] + (motion_burst_buffer[5] << 8));
+}
+
+void set_dpi(uint16_t new_dpi)
+{
+    if (new_dpi < CPI_MIN)
+    {
+        new_dpi = CPI_MIN;
+    }
+
+    if (new_dpi > CPI_MAX)
+    {
+        new_dpi = CPI_MIN;
+    }
+
+    if (new_dpi == dpi)
+    {
+        return;
+    }
+
+    uint16_t reg_value = (new_dpi / CPI_MIN) - 1;
+
+    uint8_t high_byte = (reg_value >> 8) & 0x0F;
+    uint8_t low_byte = reg_value & 0xFF;
+
+    // both x y resolution set by RESOLUTION_X_L,RESOLUTION_X_h
+    paw3395_write(MOTION_CTRL, 0x00);
+
+    paw3395_write(RESOLUTION_X_LOW, low_byte);
+    paw3395_write(RESOLUTION_X_HIGH, high_byte);
+
+    // refresh
+    paw3395_write(SET_RESOLUTION, 0x01);
+
+    delay_500ns();
+
+    dpi = new_dpi;
+
+    ESP_LOGI(TAG, "current DPI(CPI):%d", dpi);
+
+    nvs_handle_t nvs_handle;
+    esp_err_t ret = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(ret));
+    }
+
+    ret = nvs_set_u16(nvs_handle, "dpi", dpi);
+    nvs_close(nvs_handle);
+}
+
+/**
+ * @brief resume dpi to last storage value
+ */
+void resume_dpi(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t ret = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    uint16_t dpi;
+    ret = nvs_get_u16(nvs_handle, "dpi", &dpi);
+    nvs_close(nvs_handle);
+
+    if (ret == ESP_OK)
+    {
+        set_dpi(dpi);
+    }
+    else
+    {
+        set_dpi(1600);//默认dpi
     }
 }
